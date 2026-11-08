@@ -1,5 +1,7 @@
 #pragma once
 
+#include <functional>
+#include <optional>
 #include <unordered_set>
 
 #include "client_service.h"
@@ -75,9 +77,23 @@ class FileStorage {
         const std::vector<std::string>& keys,
         const std::vector<int64_t>& sizes);
 
+    // Reads [offset, offset + length) of each value. Returned pointers address
+    // the first requested byte, not the start of the object.
+    tl::expected<BatchGetResult, ErrorCode> BatchGetRanges(
+        const std::vector<std::string>& keys,
+        const std::vector<int64_t>& offsets,
+        const std::vector<int64_t>& lengths,
+        const std::vector<int64_t>& object_sizes);
+
     tl::expected<LocalBatchResult, ErrorCode> BatchGetLocal(
         const std::vector<std::string>& keys,
         const std::vector<int64_t>& sizes);
+
+    tl::expected<LocalBatchResult, ErrorCode> BatchGetLocalRanges(
+        const std::vector<std::string>& keys,
+        const std::vector<int64_t>& offsets,
+        const std::vector<int64_t>& lengths,
+        const std::vector<int64_t>& object_sizes);
 
     [[nodiscard]] bool HasPinnedRestoreArena() const {
         return pinned_restore_arena_allocator_ != nullptr;
@@ -103,6 +119,43 @@ class FileStorage {
     tl::expected<bool, ErrorCode> Exists(const std::string& key);
 
     FileStorageConfig config_;
+
+    /**
+     * @brief Promote a set of keys from local SSD to DRAM (SSD prefetch).
+     *
+     * Each key must already have a promotion task registered on the master
+     * (Client::RegisterPrefetchTask) with this client as holder; this method
+     * runs the promotion execution chain (PromotionAllocStart -> staging
+     * AllocateBatch -> BatchLoad -> PromotionWrite -> NotifyPromotionSuccess).
+     * Failures are reported per-key via on_key_done and do not propagate;
+     * this is best-effort.
+     *
+     * @param keys  Keys to promote
+     * @param sizes Corresponding object sizes in bytes
+     * @param dram_pressure Optional out-flag, set to true if any key failed
+     *        because the master is out of DRAM (PromotionAllocStart returned
+     *        NO_AVAILABLE_HANDLE), so the caller can back off prefetch and let
+     *        eviction/offload reclaim memory. Never reset to false here;
+     *        the caller initializes it.
+     * @param on_key_done Optional per-key completion callback.
+     * @return void on success, ErrorCode on critical (pre-loop) failure
+     */
+    using PrefetchKeyCallback =
+        std::function<void(const std::string& key, bool success)>;
+
+    tl::expected<void, ErrorCode> PrefetchKeys(
+        const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
+        bool* dram_pressure = nullptr,
+        PrefetchKeyCallback on_key_done = nullptr,
+        const std::string& tenant_id = "");
+
+    /**
+     * @brief Local SSD object size from the storage backend's authoritative
+     * metadata (with tenant-scoped key fallback). Remote callers' size hints
+     * must not be trusted for allocation sizing.
+     */
+    std::optional<int64_t> LookupLocalObjectSize(
+        const std::string& key, const std::string& tenant_id = "") const;
 
     /**
      * @brief Releases buffer associated with a specific batch_id.
@@ -194,6 +247,21 @@ class FileStorage {
      */
     tl::expected<void, ErrorCode> ProcessPromotionTasks();
 
+    /**
+     * @brief Execute the promotion chain for one key whose LOCAL_DISK replica
+     * lives on this node: PromotionAllocStart -> staging AllocateBatch ->
+     * BatchLoad -> PromotionWrite -> NotifyPromotionSuccess, with eager
+     * NotifyPromotionFailure on every failure path (RAII guard).
+     *
+     * Shared by the heartbeat-driven promotion-on-hit path
+     * (ProcessPromotionTasks) and the prefetch path (PrefetchKeys).
+     * @param dram_pressure Optional out-flag set when PromotionAllocStart
+     *        failed with NO_AVAILABLE_HANDLE (master out of DRAM).
+     */
+    tl::expected<void, ErrorCode> PromoteOneKeyFromLocalDisk(
+        const std::string& key, const std::string& tenant_id, int64_t size,
+        bool* dram_pressure);
+
     tl::expected<bool, ErrorCode> IsEnableOffloading();
 
     tl::expected<void, ErrorCode> RunDiskWatermarkEviction();
@@ -203,6 +271,15 @@ class FileStorage {
 
     tl::expected<void, ErrorCode> BatchLoad(
         std::unordered_map<std::string, Slice>& batch_object);
+
+    tl::expected<void, ErrorCode> BatchLoadSpans(
+        std::unordered_map<std::string, StorageValueSpan>& spans);
+
+    tl::expected<std::shared_ptr<AllocatedBatch>, ErrorCode> LoadRanges(
+        const std::vector<std::string>& keys,
+        const std::vector<int64_t>& offsets,
+        const std::vector<int64_t>& lengths,
+        const std::vector<int64_t>& object_sizes, bool prefer_pinned);
 
     tl::expected<void, ErrorCode> BatchQuerySegmentSlices(
         const std::vector<std::string>& keys, const std::string& tenant_id,
@@ -236,6 +313,9 @@ class FileStorage {
     std::shared_ptr<ClientBufferAllocator> pinned_restore_arena_allocator_;
     std::shared_ptr<StorageBackendInterface> storage_backend_;
     std::shared_ptr<ClientBufferAllocator> client_buffer_allocator_;
+    // Whether client_buffer_allocator_'s buffer is the io_uring fixed buffer,
+    // which the destructor must unregister before the buffer is freed.
+    bool uring_buffer_registered_ = false;
     mutable Mutex client_buffer_mutex_;
     std::unordered_map<uint64_t, std::shared_ptr<AllocatedBatch>> GUARDED_BY(
         client_buffer_mutex_) client_buffer_allocated_batches_;
